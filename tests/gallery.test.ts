@@ -5,6 +5,10 @@ import { defaultParams, type Task } from '../src/types'
 import { dateKey, filterTasks, mergeGallery, UNASSIGNED } from '../src/lib/gallery'
 import { hydrateTasks, loadGallery, saveGallery } from '../src/lib/storage'
 import { createBackup, createImageZip, readBackup } from '../src/lib/archive'
+import { backendFetch, installBackendFixture } from './backendFixture'
+import { readLegacyState } from '../src/lib/legacyStorage'
+
+installBackendFixture()
 
 const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5GkAAAAASUVORK5CYII='
 const workspace = { id: 'space-1', name: '产品摄影', createdAt: 1 }
@@ -43,15 +47,17 @@ describe('gallery directories', () => {
 
 describe('persistent gallery and portable ZIP backup', () => {
   it('migrates legacy data, stores images separately and hydrates selected tasks only', async () => {
-    storage.set('yansd-image-tasks', JSON.stringify([task()]))
-    expect(loadGallery().tasks).toHaveLength(1)
+    storage.set('yansd-image-tasks', JSON.stringify([task({ workspaceId: undefined })]))
+    const legacy = await readLegacyState()
+    const response = await backendFetch('/api/migrate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(legacy) })
+    expect(response.ok).toBe(true)
+    expect((await loadGallery()).tasks).toHaveLength(1)
     const metadata = await saveGallery([task()], [workspace])
-    expect(metadata[0].images[0]).toMatch(/^idb:/)
-    expect(storage.has('yansd-image-tasks')).toBe(false)
-    expect(loadGallery().workspaces).toEqual([workspace])
+    expect(metadata[0].images[0]).toMatch(/^\/api\/images\//)
+    expect((await loadGallery()).workspaces).toEqual([workspace])
     expect((await hydrateTasks(metadata))[0]).toEqual(task())
     // An unreadable image in another directory does not break this selection.
-    const other = task({ id: 'missing', images: ['idb:missing'] })
+    const other = task({ id: 'missing', images: [`/api/images/${'0'.repeat(64)}.png`] })
     const selected = filterTasks([...metadata, other], { tab: 'date', date: '', workspace: '', search: 'no-match', favoritesOnly: false })
     expect(await hydrateTasks(selected)).toEqual([])
     await expect(hydrateTasks([other])).rejects.toThrow('缺失')
@@ -69,7 +75,7 @@ describe('persistent gallery and portable ZIP backup', () => {
     await saveGallery([], [])
     const imported = await readBackup(backup)
     await saveGallery(imported.tasks, imported.workspaces)
-    expect(await hydrateTasks(loadGallery().tasks)).toEqual(gallery.tasks)
+    expect(await hydrateTasks((await loadGallery()).tasks)).toEqual(gallery.tasks)
   })
   it('packages every selected output using its actual image type', async () => {
     const zip = await JSZip.loadAsync(await (await createImageZip([task({ images: [png, png] }), task({ id: 'other' })])).arrayBuffer())
@@ -90,17 +96,17 @@ describe('persistent gallery and portable ZIP backup', () => {
     await expect(readBackup(await good.generateAsync({ type: 'blob' }))).rejects.toThrow('结构无效')
     good.file('manifest.json', JSON.stringify({ ...manifest, version: 99 }))
     await expect(readBackup(await good.generateAsync({ type: 'blob' }))).rejects.toThrow('不是受支持')
-    expect(loadGallery().tasks).toHaveLength(0)
+    expect((await loadGallery()).tasks).toHaveLength(0)
   })
   it('preserves committed metadata on save failure and can save again', async () => {
     await saveGallery([task()], [workspace])
-    const setItem = localStorage.setItem
-    localStorage.setItem = () => { throw new Error('QuotaExceededError') }
-    await expect(saveGallery([task({ id: 'new' })], [workspace])).rejects.toThrow('QuotaExceededError')
-    expect(loadGallery().tasks[0].id).toBe('task-1')
-    expect((await hydrateTasks(loadGallery().tasks))[0].images).toEqual([png])
-    localStorage.setItem = setItem
+    vi.stubGlobal('fetch', (input: string, init?: RequestInit) => input === '/api/gallery' && init?.method === 'PUT'
+      ? Promise.resolve(new Response(JSON.stringify({ error: 'disk full' }), { status: 500 })) : backendFetch(input, init))
+    await expect(saveGallery([task({ id: 'new' })], [workspace])).rejects.toThrow('disk full')
+    expect((await loadGallery()).tasks[0].id).toBe('task-1')
+    expect((await hydrateTasks((await loadGallery()).tasks))[0].images).toEqual([png])
+    vi.stubGlobal('fetch', backendFetch)
     await saveGallery([task({ id: 'recovered' })], [workspace])
-    expect(loadGallery().tasks[0].id).toBe('recovered')
+    expect((await loadGallery()).tasks[0].id).toBe('recovered')
   })
 })

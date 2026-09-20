@@ -2,9 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Settings, Search, Heart, Trash2, X, ChevronLeft, ChevronRight, ChevronDown, Download, Image as ImageIcon, LoaderCircle, AlertCircle, Check, Upload, Paperclip, ArrowRight, RefreshCw, Github, Pencil, Folder, Plus, ListChecks } from 'lucide-react'
 import type { GenerationParams, Provider, ReferenceImage, Settings as AppSettings, Task, Workspace } from './types'
-import { defaultParams } from './types'
+import { defaultParams, defaultSettings } from './types'
 import { fetchAvailableModels, generateImages } from './lib/imageApi'
-import { hydrateTasks, loadGallery, loadLastWorkspace, loadModelSelections, loadSettings, saveGallery, saveLastWorkspace, saveModelSelections, saveSettings } from './lib/storage'
+import { hydrateTasks, initializeStorage, saveGallery, saveLastWorkspace, saveModelSelections, saveSettings } from './lib/storage'
 import { createBackup, createImageZip, downloadBlob, readBackup, readImage } from './lib/archive'
 import { dateKey, filterTasks, mergeGallery, UNASSIGNED, type DirectoryTab } from './lib/gallery'
 import { GalleryDirectory } from './components/GalleryDirectory'
@@ -36,7 +36,7 @@ function readFileAsDataUrl(file: File) {
 }
 
 export default function App() {
-  const [settings, setSettings] = useState<AppSettings>(() => loadSettings())
+  const [settings, setSettings] = useState<AppSettings>(defaultSettings)
   const [tasks, setTasks] = useState<Task[]>([])
   const [tasksLoaded, setTasksLoaded] = useState(false)
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
@@ -53,7 +53,7 @@ export default function App() {
   const [storageError, setStorageError] = useState('')
   const importInputRef = useRef<HTMLInputElement>(null)
   const [provider, setProvider] = useState<Provider>('openai')
-  const [selectedModels, setSelectedModels] = useState(() => loadModelSelections())
+  const [selectedModels, setSelectedModels] = useState(() => emptyProviderState(''))
   const [availableModels, setAvailableModels] = useState<Record<Provider, string[]>>(() => emptyProviderState([]))
   const [modelsFetched, setModelsFetched] = useState<Record<Provider, boolean>>(() => emptyProviderState(false))
   const [modelsLoading, setModelsLoading] = useState<Record<Provider, boolean>>(() => emptyProviderState(false))
@@ -73,14 +73,19 @@ export default function App() {
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   useEffect(() => {
-    try {
-      const stored = loadGallery()
+    let cancelled = false
+    void initializeStorage().then((state) => {
+      if (cancelled) return
+      const stored = state.gallery
+      setSettings(state.settings)
+      setSelectedModels(state.modelSelections)
       setTasks(stored.tasks.map((task) => task.status === 'running' ? { ...task, status: 'error', error: '上次生成已中断，可以重试' } : task))
       setWorkspaces(stored.workspaces)
-      const last = loadLastWorkspace()
+      const last = state.lastWorkspace
       setSelectedWorkspace(stored.workspaces.some((workspace) => workspace.id === last) ? last : '')
       setTasksLoaded(true)
-    } catch { setStorageError('本地画廊读取失败，请检查浏览器存储设置后刷新页面。') }
+    }).catch((error) => { if (!cancelled) setStorageError(error instanceof Error ? error.message : '后端画廊读取失败，请检查 Go 服务后刷新页面。') })
+    return () => { cancelled = true }
   }, [])
   useEffect(() => {
     if (!tasksLoaded) return
@@ -91,17 +96,17 @@ export default function App() {
       setStorageError('')
       // Release full image strings after persistence. Only mounted cards hydrate them.
       if (hasInlineImages) setTasks((current) => current === tasks ? metadata : current)
-    }).catch(() => { if (!cancelled) setStorageError('保存失败，可能是浏览器存储空间不足。请先导出备份，再清理空间，避免刷新后丢失新作品。') })
+    }).catch((error) => { if (!cancelled) setStorageError(`保存失败：${error instanceof Error ? error.message : '请检查后端服务和磁盘空间'}。请先导出备份，避免刷新后丢失新作品。`) })
     return () => { cancelled = true }
   }, [tasks, workspaces, tasksLoaded])
   useEffect(() => {
     if (tasksLoaded) {
-      try { saveLastWorkspace(selectedWorkspace) }
-      catch { setStorageError('无法保存上次选择的工作区，请检查浏览器存储空间。') }
+      void saveLastWorkspace(selectedWorkspace).catch((error) => setStorageError(`无法保存上次选择的工作区：${error.message}`))
     }
   }, [selectedWorkspace, tasksLoaded])
-  useEffect(() => saveSettings(settings), [settings])
-  useEffect(() => saveModelSelections(selectedModels), [selectedModels])
+  useEffect(() => {
+    if (tasksLoaded) void saveModelSelections(selectedModels).catch((error) => setStorageError(`无法保存模型选择：${error.message}`))
+  }, [selectedModels, tasksLoaded])
   useEffect(() => {
     if (!notice) return
     const timer = window.setTimeout(() => setNotice(null), 3000)
@@ -133,7 +138,7 @@ export default function App() {
     }
     setModelsLoading((current) => ({ ...current, [target]: true }))
     try {
-      const next = await fetchAvailableModels(target, settings)
+      const next = await fetchAvailableModels(target)
       setAvailableModels((current) => ({ ...current, [target]: next }))
       setModelsFetched((current) => ({ ...current, [target]: true }))
       setNotice(next.length
@@ -210,7 +215,7 @@ export default function App() {
     setReferenceImages([])
     setEditSession(null)
     try {
-      const images = await generateImages(provider, settings, model, task.prompt, task.params, task.referenceImages ?? [])
+      const images = await generateImages(provider, model, task.prompt, task.params, task.referenceImages ?? [])
       setTasks((current) => current.map((item) => item.id === task.id ? { ...item, images, status: 'done' } : item))
       setNotice({ type: 'success', text: generationCompleteMessage(images.length, task.params.count) })
     } catch (error) {
@@ -223,7 +228,7 @@ export default function App() {
     setTasks((current) => current.map((item) => item.id === task.id ? { ...item, images: [], status: 'running', error: undefined } : item))
     try {
       const [hydrated] = await hydrateTasks([task])
-      const images = await generateImages(task.provider, settings, task.model, task.prompt, task.params, hydrated.referenceImages ?? [])
+      const images = await generateImages(task.provider, task.model, task.prompt, task.params, hydrated.referenceImages ?? [])
       setTasks((current) => current.map((item) => item.id === task.id ? { ...item, images, status: 'done', error: undefined } : item))
       setNotice({ type: 'success', text: `重试${generationCompleteMessage(images.length, task.params.count)}` })
     } catch (error) {
@@ -246,6 +251,7 @@ export default function App() {
     setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })
   }
   function saveWorkspace(id: string, newName: string) {
+    if (!tasksLoaded) return
     const workspaceId = newName ? uid() : id
     if (newName) setWorkspaces((current) => [...current, { id: workspaceId, name: newName, createdAt: Date.now() }])
     if (workspaceDialog?.taskIds) {
@@ -319,6 +325,20 @@ export default function App() {
     await addReferenceFileArray(pastedImages)
   }
 
+  async function updateSettings(next: AppSettings) {
+    if (!tasksLoaded || busy) return
+    setBusy('正在保存配置…')
+    try {
+      await saveSettings(next)
+      setSettings(next)
+      setAvailableModels(emptyProviderState([]))
+      setModelsFetched(emptyProviderState(false))
+      setSettingsOpen(false)
+      setNotice({ type: 'success', text: '配置已保存' })
+    } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : '配置保存失败' }) }
+    finally { setBusy('') }
+  }
+
   const lightboxTask = lightbox ? tasks.find((task) => task.id === lightbox.taskId) : undefined
   const lightboxSources = useImageSources(lightboxTask?.images ?? EMPTY_IMAGES)
   const lightboxImage = lightbox ? lightboxSources.images[lightbox.index] : undefined
@@ -327,7 +347,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar" inert={Boolean(busy)}>
         <div className="brand"><div className="brand-mark"><img src="./logo.png" alt="烟神殿" /></div><div><strong>烟神殿生图工具</strong><span>多模型生图画廊</span></div></div>
-        <div className="topbar-actions"><div className="status-pill"><span className={generating ? 'status-dot busy' : hasApiKey ? 'status-dot' : 'status-dot missing'} />{generating ? `${generating} 个任务生成中` : hasApiKey ? '工作区已就绪' : 'API 密钥未配置'}</div><a className="github-link" href="https://github.com/yansd001/ImageAtelier" target="_blank" rel="noreferrer"><Github size={16} /><span>yansd001/ImageAtelier</span></a><button className="icon-button" onClick={() => setSettingsOpen(true)} title="配置 API"><Settings size={18} /></button></div>
+        <div className="topbar-actions"><div className="status-pill"><span className={generating ? 'status-dot busy' : hasApiKey ? 'status-dot' : 'status-dot missing'} />{generating ? `${generating} 个任务生成中` : hasApiKey ? '工作区已就绪' : 'API 密钥未配置'}</div><a className="github-link" href="https://github.com/yansd001/ImageAtelier" target="_blank" rel="noreferrer"><Github size={16} /><span>yansd001/ImageAtelier</span></a><button className="icon-button" onClick={() => setSettingsOpen(true)} disabled={!tasksLoaded} title="配置 API"><Settings size={18} /></button></div>
       </header>
       <div className={`workspace ${tasks.length > 0 ? 'has-tasks' : ''}`} inert={Boolean(busy)}>
         <GalleryDirectory tasks={tasks} workspaces={workspaces} tab={directoryTab} date={selectedDate} workspace={workspaceFilter} onTab={setDirectoryTab} onDate={setSelectedDate} onWorkspace={setWorkspaceFilter} onCreate={() => setWorkspaceDialog({})} />
@@ -352,14 +372,14 @@ export default function App() {
         {editSession && <div className="composer-editing-bar"><span><Pencil size={14} /><span><strong>编辑后重新生成</strong><small>已恢复原任务的模型、参数、工作区和参考图</small></span></span><button type="button" onClick={cancelEditing} title="取消编辑" aria-label="取消编辑"><X size={16} /></button></div>}
         {referenceImages.length > 0 && <div className="reference-above-input"><div className="reference-strip">{referenceImages.map((image, index) => <div className="reference-thumb" key={image.id}><div className="reference-preview-button" role="button" tabIndex={0} onPointerUp={(event) => { event.stopPropagation(); setReferenceLightboxIndex(index) }} onClick={(event) => { event.stopPropagation(); setReferenceLightboxIndex(index) }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setReferenceLightboxIndex(index) } }} title="查看参考图"><img src={image.dataUrl} alt={image.name} /></div><button type="button" className="reference-remove-button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setReferenceImages((current) => current.filter((item) => item.id !== image.id)) }} title="移除参考图"><X size={12} /></button></div>)}</div></div>}
         <textarea ref={promptInputRef} className="bottom-prompt-input" value={prompt} onChange={(event) => setPrompt(event.target.value)} onPaste={(event) => void handlePromptPaste(event)} placeholder="描述你想生成的图片，可直接粘贴图片作为参考图..." rows={2} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void submit() } }} />
-        <div className="bottom-controls"><div className="bottom-parameter-area">{provider === 'openai' ? <OpenAIParams params={params} updateParam={updateParam} /> : <GeminiParams params={params} updateParam={updateParam} />}</div><div className="bottom-reference-area"><input ref={referenceInputRef} className="hidden-file-input" type="file" accept="image/*" multiple onChange={(event) => void addReferenceFiles(event.target.files)} /><button className="attachment-button" onClick={() => referenceInputRef.current?.click()} title="上传参考图"><Paperclip size={18} /></button></div><button className={`generate-icon-button ${prompt.trim() && model.trim() && hasApiKey && tasksLoaded ? 'ready' : ''}`} onClick={() => void submit()} disabled={!tasksLoaded} title={!tasksLoaded ? '正在加载本地画廊' : !hasApiKey ? 'API 密钥未配置' : !model.trim() ? '请输入或选择生图模型' : prompt.trim() ? editSession ? '重新生成图片' : '生成图片' : '请输入提示词'}>{editSession ? <RefreshCw size={20} /> : <ArrowRight size={21} />}</button></div>
+        <div className="bottom-controls"><div className="bottom-parameter-area">{provider === 'openai' ? <OpenAIParams params={params} updateParam={updateParam} /> : <GeminiParams params={params} updateParam={updateParam} />}</div><div className="bottom-reference-area"><input ref={referenceInputRef} className="hidden-file-input" type="file" accept="image/*" multiple onChange={(event) => void addReferenceFiles(event.target.files)} /><button className="attachment-button" onClick={() => referenceInputRef.current?.click()} title="上传参考图"><Paperclip size={18} /></button></div><button className={`generate-icon-button ${prompt.trim() && model.trim() && hasApiKey && tasksLoaded ? 'ready' : ''}`} onClick={() => void submit()} disabled={!tasksLoaded} title={!tasksLoaded ? '正在加载画廊' : !hasApiKey ? 'API 密钥未配置' : !model.trim() ? '请输入或选择生图模型' : prompt.trim() ? editSession ? '重新生成图片' : '生成图片' : '请输入提示词'}>{editSession ? <RefreshCw size={20} /> : <ArrowRight size={21} />}</button></div>
         </section>
         </div>
       </div>
       {workspaceDialog && <WorkspaceDialog workspaces={workspaces} assignment={workspaceDialog.taskIds?.length} initialId={workspaceDialog.taskIds?.length === 1 ? tasks.find((task) => task.id === workspaceDialog.taskIds?.[0])?.workspaceId : ''} onSave={saveWorkspace} onClose={() => setWorkspaceDialog(null)} />}
-      {deleteIds && <Dialog title="删除作品" onClose={() => setDeleteIds(null)}><p>确定删除选中的 {deleteIds.length} 个作品及其中的 {tasks.filter((task) => deleteIds.includes(task.id)).reduce((count, task) => count + task.images.length, 0)} 张图片吗？</p><p className="dialog-hint">作品及参考图将从当前浏览器移除，删除后无法恢复。{tasks.some((task) => deleteIds.includes(task.id) && task.status === 'running') && '正在生成的结果也不会保留。'}</p><div className="modal-footer"><button className="secondary-button" onClick={() => setDeleteIds(null)}>取消</button><button className="primary-button danger-button" onClick={() => removeTasks(deleteIds)}>确认删除</button></div></Dialog>}
+      {deleteIds && <Dialog title="删除作品" onClose={() => setDeleteIds(null)}><p>确定删除选中的 {deleteIds.length} 个作品及其中的 {tasks.filter((task) => deleteIds.includes(task.id)).reduce((count, task) => count + task.images.length, 0)} 张图片吗？</p><p className="dialog-hint">作品及参考图将从画廊移除，删除后无法恢复。{tasks.some((task) => deleteIds.includes(task.id) && task.status === 'running') && '正在生成的结果也不会保留。'}</p><div className="modal-footer"><button className="secondary-button" onClick={() => setDeleteIds(null)}>取消</button><button className="primary-button danger-button" onClick={() => removeTasks(deleteIds)}>确认删除</button></div></Dialog>}
       {busy && <div className="busy-overlay" role="status" aria-live="polite"><LoaderCircle size={24} className="spin" /><span>{busy}</span></div>}
-      {settingsOpen && <SettingsModal settings={settings} onSave={(next) => { setSettings(next); setAvailableModels(emptyProviderState([])); setModelsFetched(emptyProviderState(false)); setSettingsOpen(false); setNotice({ type: 'success', text: '配置已保存' }) }} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsModal settings={settings} onSave={(next) => { void updateSettings(next) }} onClose={() => setSettingsOpen(false)} />}
       {lightbox && lightboxImage && lightboxTask && <Lightbox task={lightboxTask} index={lightbox.index} src={lightboxImage} onClose={() => setLightbox(null)} onChange={(index) => setLightbox({ taskId: lightboxTask.id, index })} onEdit={() => void editTask(lightboxTask)} onDownloadError={(text) => setNotice({ type: 'error', text })} />}
       {referenceLightboxIndex !== null && referenceImages[referenceLightboxIndex] && <ReferenceLightbox images={referenceImages} index={referenceLightboxIndex} onClose={() => setReferenceLightboxIndex(null)} onChange={setReferenceLightboxIndex} />}
       {notice && <div className={`toast ${notice.type}`}><span>{notice.type === 'success' ? <Check size={16} /> : <AlertCircle size={16} />}</span>{notice.text}<button onClick={() => setNotice(null)}><X size={14} /></button></div>}
@@ -389,7 +409,7 @@ async function downloadImageDirect(src: string, filename: string, onError: (mess
     const image = await readImage(src)
     downloadBlob(new Blob([image.bytes as BlobPart], { type: image.mime }), `${filename.replace(/\.(png|jpe?g|webp)$/i, '')}.${image.extension}`)
   } catch (error) {
-    onError(error instanceof Error ? error.message : '图片下载失败，请检查图片地址或跨域配置')
+    onError(error instanceof Error ? error.message : '图片下载失败，请检查后端服务或图片文件')
   }
 }
 

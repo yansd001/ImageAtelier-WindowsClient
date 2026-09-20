@@ -1,37 +1,58 @@
 # Image Atelier
 
-一个面向画廊工作流的多模型生图应用，支持 OpenAI 与 Gemini 提供商。
+一个面向画廊工作流的多模型生图应用，支持 OpenAI 与 Gemini 提供商。React 前端负责交互，Go 后端负责配置与作品持久化、模型列表、生图请求和远程图片下载，不使用数据库。
+
+## 打包与运行
+
+构建机器需要 Node.js 22+ 和 Go 1.23+；Go 后端仅使用标准库。
+
+```bash
+npm install
+npm run build
+```
+
+唯一的发布目录为 `release/ImageAtelier/`：
+
+```text
+ImageAtelier/
+├── ImageAtelier.exe       # Windows x64 Go 后端
+└── frontend/             # 原前端的构建资源
+    ├── index.html
+    ├── logo.png
+    └── assets/
+```
+
+将整个 `ImageAtelier` 文件夹复制到目标电脑，双击 `ImageAtelier.exe` 即可。程序启动 HTTP 服务并自动在默认浏览器打开 `http://127.0.0.1:47831`，不需要安装 Node.js、Go 或单独启动前端。关闭程序的控制台窗口即可停止服务。
+
+前端资源和数据默认按 **exe 所在目录** 定位，从其他目录的终端或快捷方式启动也不受影响。首次使用后会在 exe 旁生成 `data/`。升级时替换 exe 和 `frontend/`，保留 `data/`；重新构建也不会删除已有数据。
+
+需要自定义端口或关闭自动打开浏览器时，可直接运行：
+
+```powershell
+.\ImageAtelier.exe -listen 127.0.0.1:8080 -open-browser=false
+```
+
+如果提示端口被占用，请关闭仍在运行的旧后端，或指定其他端口。
 
 ## 开发
 
 ```bash
-npm install
 npm run dev
 ```
 
-生产构建：
+此命令自动启动 Go 后端和 Vite，打开终端显示的前端地址（默认 `http://localhost:5173`）。Vite 将 `/api` 转发给后端。前端支持热更新；修改 Go 代码后重新运行命令。开发数据位于项目根目录的 `data/`，开发和测试使用的临时可执行文件位于 `.cache/`。
 
-```bash
-npm run build
-npm run preview
-```
+也可分别运行 `npm run dev:backend`（默认 `127.0.0.1:47831`）和 `npm run dev:frontend`。自定义后端地址时，为前端设置 `IMAGE_ATELIER_BACKEND_URL`。
 
-桌面版开发预览（先构建前端，再启动 Electron）：
+## 数据存储
 
-```bash
-npm run desktop
-```
+- 发布版默认写入 exe 旁的 `data/`，与启动时的工作目录无关。
+- `state.json` 保存 API 配置、模型选择、上次工作区、任务、收藏、工作区和迁移记录。`images/` 保存原图与参考图，按内容哈希去重；JSON 中只保存图片路径。
+- 所有保存经过串行提交，先写入临时文件，再替换 JSON。保存失败会保留已提交数据并在页面显示错误；多个窗口同时编辑时，旧版本保存会被拒绝并提示刷新。
+- 图片删除后不再出现在画廊和导出中。后端启动时清理未被引用且超过 24 小时的图片文件，避免误删尚待保存的生成结果。
+- 可通过 `-data`、`-listen`、`-web` 或环境变量 `IMAGE_ATELIER_DATA_DIR`、`IMAGE_ATELIER_ADDR`、`IMAGE_ATELIER_WEB_DIR` 指定数据目录、监听地址和前端目录。同一数据目录只运行一个后端进程。默认仅监听本机；多浏览器连接同一后端时共享数据。配置文件包含 API Key，完整迁移配置与作品时，在服务停止后复制整个数据目录。
 
-## 发布
-
-- 在 GitHub Actions 中手动运行 `Release Windows`，输入语义化版本号（如 `1.2.3`），工作流会创建 `v1.2.3` Release 并上传可直接双击运行的 Windows x64 portable EXE。
-- `Publish Docker Image` 会在推送到 `main`、推送 `v*` 标签或手动运行时，将镜像发布到 `ghcr.io/yansd001/imageatelier`。手动运行时可输入镜像版本号。
-
-本地运行容器：
-
-```bash
-docker run --rm -p 8080:80 ghcr.io/yansd001/imageatelier:latest
-```
+旧版 `localStorage` 和 IndexedDB 数据会在原浏览器、原站点地址首次打开时自动迁移到后端；只有后端成功保存后才清除旧元数据，IndexedDB 原图保留为恢复副本。换域名、端口、电脑或从旧桌面客户端迁移时，应先在旧版导出 ZIP，再在新版导入。已有 Go 后端数据可在服务停止后将整个 `data/` 复制到新 exe 旁。新数据不再写入浏览器存储。
 
 ## 使用
 
@@ -43,19 +64,19 @@ docker run --rm -p 8080:80 ghcr.io/yansd001/imageatelier:latest
 https://example.com/?baseurl=https%3A%2F%2Fcode.yansd666.com&apikey=YOUR_API_KEY
 ```
 
-`baseurl` 和 `apikey` 可以单独使用。参数存在时会覆盖浏览器中已保存的对应全局配置，并继续保存到本地；不传参数时仍使用原有配置。参数值应进行 URL 编码，且 API Key 会出现在浏览器地址、历史记录和可能的服务器日志中，仅应在可信环境下使用。
+`baseurl` 和 `apikey` 可以单独使用。参数存在时会覆盖后端已保存的对应全局配置，并写入 JSON；不传参数时仍使用原有配置。参数值应进行 URL 编码，且 API Key 会出现在浏览器地址、历史记录和可能的服务器日志中，仅应在可信环境下使用。
 
 - OpenAI 显示尺寸、质量、背景、输出格式、生成数量，调用 `/images/generations`；多张图片按数量逐张请求，每张失败自动重试一次。
 - Gemini 显示画面比例、图像分辨率、生成数量，调用 `models/{model}:generateContent`，解析 `inlineData` 图片响应；多张图片同样逐张请求，失败图片会跳过并保留成功结果。
 
-生成面板支持上传最多 8 张 JPG、PNG 或 WEBP 参考图。OpenAI 会自动切换到 `/images/edits` multipart 请求，Gemini 会将参考图作为 `inlineData` 发送。任务信息、工作区和配置保存在浏览器 `localStorage` 中，原图和参考图保存在 IndexedDB 中，旧版本数据会自动迁移。
+生成面板支持上传最多 8 张 JPG、PNG 或 WEBP 参考图。Go 后端会为 OpenAI 自动切换到 `/images/edits` multipart 请求，为 Gemini 将参考图作为 `inlineData` 发送。模型列表、生图、远程原图下载及页面字体请求均由后端向外部服务发起，浏览器仅访问本应用。单张图片最大 64 MB，单次提供商请求超时为 5 分钟。
 
 画廊支持提示词搜索、收藏筛选、图片灯箱预览、上一张/下一张、下载、复制提示词和删除任务。点击画廊记录上的编辑按钮，可以恢复该任务的提示词、提供商、模型、参数、工作区和参考图并重新生成；重新生成会创建新记录，不会覆盖原作品。
 
 - 左侧目录可在「日期」和「工作区」两个 Tab 之间切换，各自记住筛选条件，仅应用当前 Tab 的目录筛选。日期按当前电脑的本地日期分组，也可以选择「全部作品」。页面只读取当前结果的图片，每次展示 48 个作品，可继续加载更多。
 - 可在目录或生成面板新建工作区。生成面板自动记住上次选择，包括「不选择工作区」。画廊作品下方的工作区标签可用于归类、移动或取消归类，也可以批量设置工作区。
 - 开启「批量选择」后，按作品勾选或全选当前筛选结果。打包下载包含选中作品的全部原图，使用实际图片格式；删除会先显示作品数和图片数，确认后执行。
-- 「导出备份」导出当前浏览器的全部作品、原图、参考图、提示词、生成参数、收藏和工作区为 ZIP 文件（不受当前筛选影响）。在另一台电脑选择「导入备份」即可恢复。导入与现有画廊合并，相同 ID 的作品跳过，同名工作区合并，不覆盖已有作品。备份不包含 API Key 或 API 配置；另一台电脑需单独配置。生成中的任务导入后可重试。单个备份支持最多 1 GB。
+- 「导出备份」导出当前画廊的全部作品、原图、参考图、提示词、生成参数、收藏和工作区为 ZIP 文件（不受当前筛选影响）。在另一台电脑选择「导入备份」即可恢复。导入与现有画廊合并，相同 ID 的作品跳过，同名工作区合并，不覆盖已有作品。备份不包含 API Key 或 API 配置；另一台电脑需单独配置。生成中的任务导入后可重试。单个备份支持最多 1 GB，继续兼容旧版 ZIP 格式。
 - 模型输入框在点击展开或重新获得焦点时显示全部已拉取模型，仅在输入时筛选，仍可直接输入自定义模型 ID。
 
 ## 验证
@@ -64,9 +85,10 @@ https://example.com/?baseurl=https%3A%2F%2Fcode.yansd666.com&apikey=YOUR_API_KEY
 npm test
 npx playwright install chromium
 npm run test:ui
-npm run build
+npm run test:package
+go vet ./backend
 ```
 
-自动化测试覆盖目录筛选、工作区归类与选择记忆、模型下拉、批量删除和 ZIP 下载、备份迁移与校验，以及移动端布局。生图接口使用模拟响应，不消耗真实 API 配额。
+自动化测试覆盖 Go JSON 重启恢复、失败保存、版本冲突、旧版数据迁移、两家提供商的实际 HTTP 请求格式、参考图与重试、远程图片缓存，以及前端目录筛选、工作区记忆、模型下拉、批量删除、ZIP 备份和移动端布局。发布包测试会把 exe 和前端资源复制到包含中文与空格的临时目录，从不同工作目录启动，验证页面、静态资源、数据保存及重启恢复。测试不修改真实数据或消耗 API 配额。
 
 网站 logo 文件放在 `public/logo.png`。建议使用烟神殿原图，页面会以方形裁剪方式显示在左上角和浏览器标签页。

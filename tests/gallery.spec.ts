@@ -1,6 +1,8 @@
 import { test, expect, type Page } from '@playwright/test'
 import JSZip from 'jszip'
-import { defaultParams } from '../src/types'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
+import { defaultParams, defaultSettings } from '../src/types'
 
 const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5GkAAAAASUVORK5CYII='
 const fixtures = {
@@ -12,16 +14,23 @@ const fixtures = {
   ].map((task) => ({ ...task, provider: 'openai', model: 'gpt-image-one', status: 'done', params: { ...defaultParams, count: task.images.length }, referenceImages: [{ id: 'ref', name: '参考.png', dataUrl: png }] })),
 }
 
+async function saveGallery(page: Page, gallery: typeof fixtures) {
+  const state = await (await page.request.get('/api/state')).json()
+  const response = await page.request.put('/api/gallery', { data: { ...gallery, revision: state.galleryRevision } })
+  expect(response.ok(), await response.text()).toBe(true)
+  return response.json()
+}
+
+test.beforeEach(async ({ page }) => {
+  await saveGallery(page, { tasks: [], workspaces: [] })
+  await page.request.put('/api/settings', { data: { ...defaultSettings, global: { baseUrl: 'http://test.invalid', apiKey: 'test-key' } } })
+  await page.request.put('/api/model-selections', { data: { openai: 'gpt-image-one', gemini: '' } })
+  await page.request.put('/api/last-workspace', { data: { id: '' } })
+  await page.route('**/api/fonts/**', (route) => route.abort())
+})
+
 async function seed(page: Page) {
-  await page.addInitScript((gallery) => {
-    if (!localStorage.getItem('ui-test-seeded')) {
-      localStorage.setItem('yansd-image-gallery', JSON.stringify(gallery))
-      localStorage.setItem('yansd-image-settings', JSON.stringify({ global: { baseUrl: 'http://test.invalid', apiKey: 'test-key' } }))
-      localStorage.setItem('yansd-image-model-selections', JSON.stringify({ openai: 'gpt-image-one', gemini: '' }))
-      localStorage.setItem('ui-test-seeded', '1')
-    }
-  }, fixtures)
-  await page.route('https://fontsapi.zeoseven.com/**', (route) => route.abort())
+  await saveGallery(page, fixtures)
   await page.goto('/')
   await expect(page.locator('.task-card')).toHaveCount(3)
   await expect(page.locator('.task-card .image-tile img').first()).toBeVisible()
@@ -51,7 +60,7 @@ test('date and workspace tabs stay independent; selecting a directory limits car
 
 test('model dropdown reopens with every model and only filters while typing', async ({ page }) => {
   await seed(page)
-  await page.route('http://test.invalid/v1/models', (route) => route.fulfill({ json: { data: [{ id: 'gpt-image-one' }, { id: 'gpt-image-two' }, { id: 'gpt-image-three' }] } }))
+  await page.route('**/api/models?provider=openai', (route) => route.fulfill({ json: ['gpt-image-one', 'gpt-image-two', 'gpt-image-three'] }))
   await page.getByRole('button', { name: '拉取模型', exact: true }).click()
   await page.getByTitle('展开模型列表').click()
   await expect(page.locator('#model-options [role="option"]')).toHaveCount(3)
@@ -74,7 +83,7 @@ test('create, remember, generate in, assign and clear a workspace', async ({ pag
   const workspaceId = await page.locator('#generation-workspace').inputValue()
   await page.reload()
   await expect(page.locator('#generation-workspace')).toHaveValue(workspaceId)
-  await page.route('http://test.invalid/v1/images/generations', (route) => route.fulfill({ json: { data: [{ b64_json: png.split(',')[1] }] } }))
+  await page.route('**/api/generate', (route) => route.fulfill({ json: { images: [png] } }))
   await page.locator('.bottom-prompt-input').fill('新的工作区作品')
   await page.getByTitle('生成图片', { exact: true }).click()
   await expect(page.locator('.task-card').filter({ hasText: '新的工作区作品' })).toContainText('已生成 1 张图片')
@@ -123,8 +132,12 @@ test('backup imports into another browser and repeating import skips duplicates'
   await page.getByRole('button', { name: '导出备份', exact: true }).click()
   const download = await downloadPromise
   const path = await download.path()
+  await page.close()
   const context = await browser.newContext()
   const other = await context.newPage()
+  await other.route('**/api/fonts/**', (route) => route.abort())
+  // A new browser shares the backend. Empty it to emulate another installation.
+  await saveGallery(other, { tasks: [], workspaces: [] })
   await other.goto('http://127.0.0.1:5173/')
   await other.locator('input[accept=".zip,application/zip"]').setInputFiles(path!)
   await expect(other.locator('.task-card')).toHaveCount(3)
@@ -155,27 +168,98 @@ test('mobile layout fits the viewport and workspace dialog remains usable', asyn
   await page.screenshot({ path: 'test-results/gallery-mobile.png', fullPage: true })
 })
 
-test('large galleries read only displayed output images from IndexedDB', async ({ page }) => {
-  const gallery = { ...fixtures, tasks: Array.from({ length: 60 }, (_, index) => ({ ...fixtures.tasks[index < 50 ? 0 : 1], id: `large-${index}`, images: [png], params: { ...defaultParams } })) }
-  await page.addInitScript((data) => {
-    localStorage.setItem('yansd-image-gallery', JSON.stringify(data))
-    const reads: string[] = []
-    Object.assign(window, { galleryImageReads: reads })
-    const get = IDBObjectStore.prototype.get
-    IDBObjectStore.prototype.get = function (key) { reads.push(String(key)); return get.call(this, key) }
-  }, gallery)
+test('large galleries load only displayed outputs from the backend', async ({ page }) => {
+  const gallery = { ...fixtures, tasks: Array.from({ length: 60 }, (_, index) => ({ ...fixtures.tasks[index < 50 ? 0 : 1], id: `large-${index}`, images: [`data:image/png;base64,${Buffer.concat([Buffer.from(png.split(',')[1], 'base64'), Buffer.from(String(index))]).toString('base64')}`], params: { ...defaultParams } })) }
+  const stored = await saveGallery(page, gallery)
+  let reads = new Set<string>()
+  page.on('request', (request) => { const path = new URL(request.url()).pathname; if (path.startsWith('/api/images/')) reads.add(path) })
   await page.goto('/')
   await expect(page.locator('.task-card')).toHaveCount(48)
-  await expect.poll(() => page.evaluate(() => (window as unknown as { galleryImageReads: string[] }).galleryImageReads.filter((id) => id.includes(':output:')).length)).toBe(48)
-  expect(await page.evaluate(() => (window as unknown as { galleryImageReads: string[] }).galleryImageReads.some((id) => id.includes(':reference:')))).toBe(false)
-  await page.evaluate(() => { (window as unknown as { galleryImageReads: string[] }).galleryImageReads.length = 0 })
+  await expect.poll(() => reads.size).toBe(48)
+  expect(reads.has(stored.tasks[0].referenceImages[0].dataUrl)).toBe(false)
+  reads = new Set()
   await page.getByRole('button', { name: '2026-09-17' }).click()
   await expect(page.locator('.task-card')).toHaveCount(10)
-  // React StrictMode can run mount effects twice in development; inspect the set of images read.
-  await expect.poll(() => page.evaluate(() => new Set((window as unknown as { galleryImageReads: string[] }).galleryImageReads).size)).toBe(10)
-  expect(await page.evaluate(() => (window as unknown as { galleryImageReads: string[] }).galleryImageReads.every((id) => /^large-5\d:output:0$/.test(id)))).toBe(true)
+  await expect.poll(() => reads.size).toBe(10)
+  expect(reads).toEqual(new Set(stored.tasks.slice(50).map((task: { images: string[] }) => task.images[0])))
   await page.locator('.directory-entry').filter({ hasText: '全部作品' }).click()
   await expect(page.locator('.task-card')).toHaveCount(48)
   await page.getByRole('button', { name: '加载更多作品', exact: false }).click()
   await expect(page.locator('.task-card')).toHaveCount(60)
+})
+
+test('settings, model requests, reference generation and originals survive a fresh browser through Go', async ({ page, browser }) => {
+  let generations = 0
+  const upstream = createServer(async (request, response) => {
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(chunk)
+    expect(request.headers.authorization).toBe('Bearer backend-only-key')
+    response.setHeader('Content-Type', 'application/json')
+    if (request.url === '/v1/models') {
+      response.end(JSON.stringify({ data: [{ id: 'gpt-image-e2e' }, { id: 'text-only' }] }))
+    } else if (request.url === '/v1/images/edits') {
+      generations++
+      expect(request.headers['content-type']).toContain('multipart/form-data')
+      expect(Buffer.concat(chunks).toString()).toContain('name="image[]"')
+      response.end(JSON.stringify({ data: [{ b64_json: png.split(',')[1] }] }))
+    } else { response.writeHead(404); response.end('{}') }
+  }).listen(0, '127.0.0.1')
+  await once(upstream, 'listening')
+  const address = upstream.address() as { port: number }
+  const external: string[] = []
+  page.on('request', (request) => { if (request.url().startsWith(`http://127.0.0.1:${address.port}`)) external.push(request.url()) })
+  try {
+    await page.goto('/')
+    await page.getByTitle('配置 API').click()
+    await page.getByPlaceholder('https://code.yansd666.com').fill(`http://127.0.0.1:${address.port}/v1`)
+    await page.getByPlaceholder('所有提供商共用的 Key').fill('backend-only-key')
+    await page.getByRole('button', { name: '保存配置', exact: true }).click()
+    await expect(page.locator('.settings-modal')).toHaveCount(0)
+    await page.getByRole('button', { name: '拉取模型', exact: true }).click()
+    await page.getByTitle('展开模型列表').click()
+    await page.getByRole('option', { name: 'gpt-image-e2e', exact: true }).click()
+    await page.locator('input[accept="image/*"]').setInputFiles({ name: 'reference.png', mimeType: 'image/png', buffer: Buffer.from(png.split(',')[1], 'base64') })
+    await page.locator('.bottom-prompt-input').fill('完整后端生成流程')
+    await page.getByTitle('生成图片', { exact: true }).click()
+    await expect(page.locator('.task-card')).toContainText('已生成 1 张图片')
+    await expect.poll(async () => (await (await page.request.get('/api/state')).json()).gallery.tasks[0]?.images[0]).toMatch(/^\/api\/images\//)
+    expect(generations).toBe(1)
+    expect(external).toEqual([])
+    expect(await page.evaluate(() => Object.keys(localStorage))).toEqual([])
+    const otherContext = await browser.newContext()
+    const other = await otherContext.newPage()
+    try {
+      await other.route('**/api/fonts/**', (route) => route.abort())
+      await other.goto('http://127.0.0.1:5173/')
+      await expect(other.locator('.task-card')).toContainText('完整后端生成流程')
+      await expect(other.locator('.task-card img')).toBeVisible()
+      await other.getByTitle('编辑后重新生成', { exact: true }).click()
+      await expect(other.locator('.reference-thumb img')).toBeVisible()
+      await expect(other.locator('.bottom-prompt-input')).toHaveValue('完整后端生成流程')
+      await other.getByTitle('配置 API').click()
+      await expect(other.getByPlaceholder('所有提供商共用的 Key')).toHaveValue('backend-only-key')
+    } finally { await otherContext.close() }
+    // Merely opening another window must not invalidate this one's gallery.
+    await page.locator('.task-card').getByTitle('收藏', { exact: true }).click()
+    await expect.poll(async () => (await (await page.request.get('/api/state')).json()).gallery.tasks[0].favorite).toBe(true)
+  } finally { upstream.closeAllConnections(); await new Promise<void>((resolve) => upstream.close(() => resolve())) }
+})
+
+test('failed initialization never saves empty defaults; settings failure keeps the editor open', async ({ page }) => {
+  const writes: string[] = []
+  page.on('request', (request) => { if (request.method() === 'PUT') writes.push(request.url()) })
+  await page.route('**/api/state', (route) => route.fulfill({ status: 503, json: { error: '后端暂不可用' } }))
+  await page.goto('/')
+  await expect(page.getByRole('alert')).toContainText('后端暂不可用')
+  await expect(page.getByTitle('配置 API')).toBeDisabled()
+  expect(writes).toEqual([])
+  await page.unroute('**/api/state')
+  await page.reload()
+  await page.getByTitle('配置 API').click()
+  await page.getByPlaceholder('所有提供商共用的 Key').fill('unsaved')
+  await page.route('**/api/settings', (route) => route.fulfill({ status: 500, json: { error: '磁盘空间不足' } }))
+  await page.getByRole('button', { name: '保存配置', exact: true }).click()
+  await expect(page.locator('.toast')).toContainText('磁盘空间不足')
+  await expect(page.locator('.settings-modal')).toBeVisible()
+  expect((await (await page.request.get('/api/state')).json()).settings.global.apiKey).toBe('test-key')
 })
