@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Settings, Search, Heart, Trash2, X, ChevronLeft, ChevronRight, ChevronDown, Download, Image as ImageIcon, LoaderCircle, AlertCircle, Check, Upload, Paperclip, ArrowRight, RefreshCw, Github, Pencil, Folder, Plus, ListChecks } from 'lucide-react'
 import type { GenerationParams, Provider, ReferenceImage, Settings as AppSettings, Task, Workspace } from './types'
 import { defaultParams, defaultSettings } from './types'
-import { fetchAvailableModels, generateImages } from './lib/imageApi'
-import { hydrateTasks, initializeStorage, saveGallery, saveLastWorkspace, saveModelSelections, saveSettings } from './lib/storage'
+import { fetchAvailableModels } from './lib/imageApi'
+import { deleteTasks, editGallery, hydrateTasks, initializeStorage, readGallery, replaceGallery, retryGeneration, saveLastWorkspace, saveModelSelections, saveSettings, submitGeneration, type GallerySnapshot } from './lib/storage'
 import { createBackup, createImageZip, downloadBlob, readBackup, readImage } from './lib/archive'
 import { dateKey, filterTasks, mergeGallery, UNASSIGNED, type DirectoryTab } from './lib/gallery'
 import { GalleryDirectory } from './components/GalleryDirectory'
@@ -51,6 +51,9 @@ export default function App() {
   const [workspaceDialog, setWorkspaceDialog] = useState<{ taskIds?: string[]; forComposer?: boolean } | null>(null)
   const [busy, setBusy] = useState('')
   const [storageError, setStorageError] = useState('')
+  const [syncError, setSyncError] = useState('')
+  const galleryRef = useRef<GallerySnapshot>({ tasks: [], workspaces: [], revision: -1 })
+  const submittingRef = useRef(false)
   const importInputRef = useRef<HTMLInputElement>(null)
   const [provider, setProvider] = useState<Provider>('openai')
   const [selectedModels, setSelectedModels] = useState(() => emptyProviderState(''))
@@ -72,6 +75,27 @@ export default function App() {
   const [referenceLightboxIndex, setReferenceLightboxIndex] = useState<number | null>(null)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
+  const applyGallery = useCallback((snapshot: GallerySnapshot) => {
+    const previous = galleryRef.current
+    if (snapshot.revision <= previous.revision) return
+    const oldTasks = new Map(previous.tasks.map((task) => [task.id, task]))
+    const nextTasks = snapshot.tasks.map((task) => {
+      const old = oldTasks.get(task.id)
+      if (old?.status === 'running' && task.status !== 'running') {
+        setNotice(task.status === 'done'
+          ? { type: 'success', text: generationCompleteMessage(task.images.length, task.params.count) }
+          : { type: 'error', text: task.error || '生成失败' })
+      }
+      // Polling must not repeatedly download unchanged originals or flicker cards.
+      if (old && JSON.stringify(old) === JSON.stringify(task)) return old
+      if (old && JSON.stringify(old.images) === JSON.stringify(task.images)) return { ...task, images: old.images }
+      return task
+    })
+    galleryRef.current = { ...snapshot, tasks: nextTasks }
+    setTasks(nextTasks)
+    setWorkspaces(snapshot.workspaces)
+  }, [])
+
   useEffect(() => {
     let cancelled = false
     void initializeStorage().then((state) => {
@@ -79,26 +103,38 @@ export default function App() {
       const stored = state.gallery
       setSettings(state.settings)
       setSelectedModels(state.modelSelections)
-      setTasks(stored.tasks.map((task) => task.status === 'running' ? { ...task, status: 'error', error: '上次生成已中断，可以重试' } : task))
-      setWorkspaces(stored.workspaces)
+      applyGallery({ ...stored, revision: state.galleryRevision })
       const last = state.lastWorkspace
       setSelectedWorkspace(stored.workspaces.some((workspace) => workspace.id === last) ? last : '')
       setTasksLoaded(true)
     }).catch((error) => { if (!cancelled) setStorageError(error instanceof Error ? error.message : '后端画廊读取失败，请检查 Go 服务后刷新页面。') })
     return () => { cancelled = true }
-  }, [])
+  }, [applyGallery])
   useEffect(() => {
     if (!tasksLoaded) return
     let cancelled = false
-    const hasInlineImages = tasks.some((task) => task.images.some((image) => image.startsWith('data:')) || task.referenceImages?.some((image) => image.dataUrl.startsWith('data:')))
-    void saveGallery(tasks, workspaces).then((metadata) => {
-      if (cancelled) return
-      setStorageError('')
-      // Release full image strings after persistence. Only mounted cards hydrate them.
-      if (hasInlineImages) setTasks((current) => current === tasks ? metadata : current)
-    }).catch((error) => { if (!cancelled) setStorageError(`保存失败：${error instanceof Error ? error.message : '请检查后端服务和磁盘空间'}。请先导出备份，避免刷新后丢失新作品。`) })
-    return () => { cancelled = true }
-  }, [tasks, workspaces, tasksLoaded])
+    let polling = false
+    let timer: number
+    const poll = async () => {
+      if (polling || cancelled) return
+      window.clearTimeout(timer)
+      polling = true
+      try {
+        const snapshot = await readGallery()
+        if (!cancelled) { applyGallery(snapshot); setSyncError('') }
+      } catch (error) {
+        if (!cancelled) setSyncError(`无法同步后台任务：${error instanceof Error ? error.message : '请检查后端服务'}，连接恢复后会自动更新。`)
+      } finally {
+        polling = false
+        if (!cancelled) timer = window.setTimeout(() => void poll(), galleryRef.current.tasks.some((task) => task.status === 'running') ? 1000 : 3000)
+      }
+    }
+    void poll()
+    const refresh = () => { if (document.visibilityState === 'visible') void poll() }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => { cancelled = true; window.clearTimeout(timer); window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh) }
+  }, [tasksLoaded, applyGallery])
   useEffect(() => {
     if (tasksLoaded) {
       void saveLastWorkspace(selectedWorkspace).catch((error) => setStorageError(`无法保存上次选择的工作区：${error.message}`))
@@ -200,47 +236,47 @@ export default function App() {
   }
 
   async function submit() {
-    if (!tasksLoaded || busy) return
+    if (!tasksLoaded || busy || submittingRef.current) return
     if (!prompt.trim()) { setNotice({ type: 'error', text: '请先输入提示词' }); return }
     if (!hasApiKey) { setNotice({ type: 'error', text: 'API 密钥未配置，请先打开设置填写 API Key' }); return }
     if (!model.trim()) { setNotice({ type: 'error', text: '请输入或选择生图模型' }); return }
     const task: Task = { id: uid(), prompt: prompt.trim(), provider, model, params: { ...params }, referenceImages: [...referenceImages], images: [], status: 'running', createdAt: Date.now(), favorite: false, workspaceId: selectedWorkspace || undefined }
-    setTasks((current) => [task, ...current])
-    galleryScrollRef.current?.scrollTo({ top: 0 })
-    setSearch('')
-    setFavoritesOnly(false)
-    if (directoryTab === 'date' && selectedDate) setSelectedDate(dateKey(task.createdAt))
-    if (directoryTab === 'workspace' && workspaceFilter) setWorkspaceFilter(task.workspaceId || UNASSIGNED)
-    setPrompt('')
-    setReferenceImages([])
-    setEditSession(null)
+    submittingRef.current = true
+    setBusy('正在提交生成任务…')
     try {
-      const images = await generateImages(provider, model, task.prompt, task.params, task.referenceImages ?? [])
-      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, images, status: 'done' } : item))
-      setNotice({ type: 'success', text: generationCompleteMessage(images.length, task.params.count) })
+      applyGallery(await submitGeneration(task))
+      galleryScrollRef.current?.scrollTo({ top: 0 })
+      setSearch('')
+      setFavoritesOnly(false)
+      if (directoryTab === 'date' && selectedDate) setSelectedDate(dateKey(task.createdAt))
+      if (directoryTab === 'workspace' && workspaceFilter) setWorkspaceFilter(task.workspaceId || UNASSIGNED)
+      setPrompt('')
+      setReferenceImages([])
+      setEditSession(null)
     } catch (error) {
-      const message = error instanceof Error ? error.message : '生成失败'
-      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: 'error', error: message } : item))
-    }
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : '任务提交失败' })
+    } finally { submittingRef.current = false; setBusy('') }
   }
 
   async function retryTask(task: Task) {
-    setTasks((current) => current.map((item) => item.id === task.id ? { ...item, images: [], status: 'running', error: undefined } : item))
-    try {
-      const [hydrated] = await hydrateTasks([task])
-      const images = await generateImages(task.provider, task.model, task.prompt, task.params, hydrated.referenceImages ?? [])
-      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, images, status: 'done', error: undefined } : item))
-      setNotice({ type: 'success', text: `重试${generationCompleteMessage(images.length, task.params.count)}` })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '生成失败'
-      setTasks((current) => current.map((item) => item.id === task.id ? { ...item, status: 'error', error: message } : item))
-    }
+    if (busy || submittingRef.current) return
+    submittingRef.current = true
+    setBusy('正在提交重试任务…')
+    try { applyGallery(await retryGeneration(task.id)) }
+    catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : '重试提交失败' }) }
+    finally { submittingRef.current = false; setBusy('') }
   }
 
-  function toggleFavorite(id: string) { setTasks((current) => current.map((task) => task.id === id ? { ...task, favorite: !task.favorite } : task)) }
-  function removeTasks(ids: string[]) {
+  async function toggleFavorite(id: string) {
+    const task = galleryRef.current.tasks.find((task) => task.id === id)
+    if (!task) return
+    try { applyGallery(await editGallery({ taskIds: [id], favorite: !task.favorite })) }
+    catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : '收藏保存失败' }) }
+  }
+  async function removeTasks(ids: string[]) {
     const removed = new Set(ids)
-    setTasks((current) => current.filter((task) => !removed.has(task.id)))
+    try { applyGallery(await deleteTasks(ids)) }
+    catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : '删除失败' }); return }
     setSelectedIds((current) => new Set([...current].filter((id) => !removed.has(id))))
     if (lightbox && removed.has(lightbox.taskId)) setLightbox(null)
     if (editSession && removed.has(editSession.taskId)) setEditSession(null)
@@ -250,13 +286,16 @@ export default function App() {
   function toggleSelection(id: string) {
     setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })
   }
-  function saveWorkspace(id: string, newName: string) {
+  async function saveWorkspace(id: string, newName: string) {
     if (!tasksLoaded) return
     const workspaceId = newName ? uid() : id
-    if (newName) setWorkspaces((current) => [...current, { id: workspaceId, name: newName, createdAt: Date.now() }])
+    try {
+      applyGallery(await editGallery({
+        ...(newName ? { workspace: { id: workspaceId, name: newName, createdAt: Date.now() } } : {}),
+        ...(workspaceDialog?.taskIds ? { taskIds: workspaceDialog.taskIds, workspaceId } : {}),
+      }))
+    } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : '工作区保存失败' }); return }
     if (workspaceDialog?.taskIds) {
-      const ids = new Set(workspaceDialog.taskIds)
-      setTasks((current) => current.map((task) => ids.has(task.id) ? { ...task, workspaceId: workspaceId || undefined } : task))
       setSelectedIds(new Set())
     } else if (workspaceDialog?.forComposer) setSelectedWorkspace(workspaceId)
     else { setDirectoryTab('workspace'); setWorkspaceFilter(workspaceId) }
@@ -289,11 +328,10 @@ export default function App() {
     setBusy('正在校验并导入备份…')
     try {
       const incoming = await readBackup(file)
-      const merged = mergeGallery({ tasks, workspaces }, incoming)
+      const current = await readGallery()
+      const merged = mergeGallery(current, incoming)
       // Save first so a failed import leaves the visible gallery unchanged.
-      const metadata = await saveGallery(merged.tasks, merged.workspaces)
-      setTasks(metadata)
-      setWorkspaces(merged.workspaces)
+      applyGallery(await replaceGallery(merged.tasks, merged.workspaces, current.revision))
       setNotice({ type: 'success', text: `已导入 ${merged.added} 个作品${merged.skipped ? `，跳过 ${merged.skipped} 个重复作品` : ''}` })
     } catch (error) { setNotice({ type: 'error', text: error instanceof Error ? error.message : '导入失败' }) }
     finally { setBusy('') }
@@ -352,7 +390,7 @@ export default function App() {
       <div className={`workspace ${tasks.length > 0 ? 'has-tasks' : ''}`} inert={Boolean(busy)}>
         <GalleryDirectory tasks={tasks} workspaces={workspaces} tab={directoryTab} date={selectedDate} workspace={workspaceFilter} onTab={setDirectoryTab} onDate={setSelectedDate} onWorkspace={setWorkspaceFilter} onCreate={() => setWorkspaceDialog({})} />
         <div className="gallery-content">
-        {storageError && <div className="storage-error" role="alert"><AlertCircle size={16} />{storageError}</div>}
+        {(storageError || syncError) && <div className="storage-error" role="alert"><AlertCircle size={16} />{storageError || syncError}</div>}
         <main className="gallery-main">
           <div className="gallery-toolbar"><div><h2>画廊 <span>{filteredTasks.length}</span></h2><p className="gallery-scope">{directoryLabel}</p></div><div className="toolbar-actions"><div className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索提示词" /></div><button className={`filter-button ${favoritesOnly ? 'selected' : ''}`} onClick={() => setFavoritesOnly((value) => !value)}><Heart size={16} fill={favoritesOnly ? 'currentColor' : 'none'} />收藏</button><button className={`secondary-button ${selectionMode ? 'active' : ''}`} onClick={() => { setSelectionMode(!selectionMode); setSelectedIds(new Set()) }}><ListChecks size={15} />{selectionMode ? '退出选择' : '批量选择'}</button></div></div>
           <div className="gallery-data-toolbar"><span>按目录浏览和整理你的作品</span><div><input type="file" accept=".zip,application/zip" className="hidden-file-input" ref={importInputRef} onChange={(event) => void importGallery(event.target.files?.[0])} /><button className="secondary-button" disabled={!tasksLoaded || Boolean(busy)} onClick={() => void exportGallery()} title="导出全部原图、参考图、提示词、参数和工作区"><Download size={14} />导出备份</button><button className="secondary-button" disabled={!tasksLoaded || Boolean(busy) || generating > 0} onClick={() => importInputRef.current?.click()} title={generating ? '生成完成后可导入' : '导入 ZIP 备份，与当前画廊合并，重复作品会跳过'}><Upload size={14} />导入备份</button></div></div>

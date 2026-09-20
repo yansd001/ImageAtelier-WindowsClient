@@ -43,7 +43,7 @@ func openStore(dir string) (*Store, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	// A stopped process cannot finish the old browser's in-flight requests.
+	// Only restarting the backend interrupts jobs. Browser navigation does not.
 	changed := false
 	for i := range s.state.Gallery.Tasks {
 		if s.state.Gallery.Tasks[i].Status == "running" {
@@ -186,6 +186,11 @@ func (s *Store) saveGallery(ctx context.Context, g Gallery, revision int64) (Gal
 	if s.state.GalleryRevision != revision {
 		return prepared, revision, errConflict
 	}
+	for _, task := range s.state.Gallery.Tasks {
+		if task.Status == "running" {
+			return prepared, revision, fmt.Errorf("%w：请等待生成完成后再导入画廊", errConflict)
+		}
+	}
 	next := s.state
 	next.Gallery = prepared
 	next.GalleryRevision++
@@ -267,8 +272,8 @@ func (s *Store) migrate(ctx context.Context, incoming State) error {
 	})
 }
 
-// A grace period also protects image results returned just before a browser
-// saves their task. Run only at startup, when this process has no active jobs.
+// Run only at startup, when this process has no active jobs. Keep recent files
+// in case a previous process stopped between writing an image and its metadata.
 func (s *Store) cleanUnusedImages() {
 	used := map[string]bool{}
 	for _, t := range s.state.Gallery.Tasks {

@@ -318,7 +318,9 @@ func TestReferenceImagesAndGemini(t *testing.T) {
 
 func TestHTTPBoundary(t *testing.T) {
 	s := newTestStore(t)
-	server := httptest.NewServer(newHandler(s, t.TempDir(), true))
+	handler := newHandler(s, t.TempDir(), true)
+	defer handler.Close()
+	server := httptest.NewServer(handler)
 	defer server.Close()
 	for _, item := range []struct {
 		method, path, body, origin, host string

@@ -2,6 +2,7 @@ import { chromium, expect } from '@playwright/test'
 import { strict as assert } from 'node:assert'
 import { access, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
+import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
@@ -38,6 +39,8 @@ env[pathKey] = browserBin + delimiter + (env[pathKey] || '')
 const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5GkAAAAASUVORK5CYII='
 let backend
 let browser
+let upstream
+let releaseGeneration
 async function stopBackend() {
   if (backend?.child.exitCode === null) {
     const closed = once(backend.child, 'exit')
@@ -84,7 +87,32 @@ try {
   assert.equal(stored.settings.global.apiKey, 'package-test-key')
   assert.match(stored.gallery.tasks[0].images[0], /^\/api\/images\//)
   await assert.rejects(access(join(workingDirectory, 'data')))
+
+  // Exercise background execution in the actual copied EXE/frontend bundle.
+  let generations = 0
+  const generationGate = new Promise((resolve) => { releaseGeneration = resolve })
+  upstream = createServer(async (request, response) => {
+    for await (const _ of request) { /* consume the provider request */ }
+    generations++
+    await generationGate
+    response.setHeader('Content-Type', 'application/json')
+    response.end(JSON.stringify({ data: [{ b64_json: png.split(',')[1] }] }))
+  }).listen(0, '127.0.0.1')
+  await once(upstream, 'listening')
+  await put('settings', { ...stored.settings, global: { ...stored.settings.global, baseUrl: `http://127.0.0.1:${upstream.address().port}` } })
+  await page.getByRole('combobox', { name: '生图模型', exact: true }).fill('gpt-image')
+  await page.locator('.bottom-prompt-input').fill('发布包后台生成')
+  await page.getByTitle('生成图片', { exact: true }).click()
+  await expect(page.locator('.task-card').filter({ hasText: '发布包后台生成' })).toContainText('生成中')
+  await page.reload()
+  await expect(page.locator('.task-card').filter({ hasText: '发布包后台生成' })).toContainText('生成中')
   await page.close()
+  releaseGeneration()
+  await expect.poll(async () => {
+    const state = JSON.parse(await readFile(join(bundle, 'data/state.json'), 'utf8'))
+    return state.gallery.tasks[0].status
+  }).toBe('done')
+  assert.equal(generations, 1)
   await stopBackend()
 
   await rm(browserRecord)
@@ -92,7 +120,9 @@ try {
   url = await backend.ready
   const restored = await (await fetch(`${url}/api/state`)).json()
   assert.equal(restored.settings.global.apiKey, 'package-test-key')
-  assert.equal(restored.gallery.tasks[0].prompt, '打包目录运行验证')
+  assert.equal(restored.gallery.tasks[0].prompt, '发布包后台生成')
+  assert.equal(restored.gallery.tasks[0].status, 'done')
+  assert.equal(restored.gallery.tasks.length, 2)
   const image = await fetch(url + restored.gallery.tasks[0].images[0])
   assert.equal(Buffer.from(await image.arrayBuffer()).toString('base64'), png.split(',')[1])
   await assert.rejects(access(browserRecord))
@@ -104,10 +134,15 @@ try {
   backend = startBackend(join(missing, 'ImageAtelier.exe'), [], { cwd: workingDirectory, env })
   await assert.rejects(backend.ready, /找不到前端页面/)
   backend = undefined
-  console.log('Package passed: automatic browser launch, copied folder, unrelated working directory, frontend/assets, data location and restart persistence.')
+  console.log('Package passed: automatic browser launch, copied folder, unrelated working directory, frontend/assets, background generation across reload/page close, data location and restart persistence.')
 } finally {
+  releaseGeneration?.()
   await browser?.close()
   await stopBackend()
+  if (upstream) {
+    upstream.closeAllConnections()
+    await new Promise((resolve) => upstream.close(resolve))
+  }
   assert.equal(dirname(resolve(temporary)), resolve(tmpdir()))
   assert.ok(basename(temporary).startsWith('image-atelier-package-'))
   await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })

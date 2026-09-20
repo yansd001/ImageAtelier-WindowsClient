@@ -59,7 +59,9 @@ func run() error {
 		return fmt.Errorf("无法监听 %s，请关闭占用此端口的旧程序，或使用 -listen 指定其他端口: %w", *address, err)
 	}
 	loopback := listener.Addr().(*net.TCPAddr).IP.IsLoopback()
-	server := &http.Server{Handler: newHandler(store, *webDir, loopback), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	handler := newHandler(store, *webDir, loopback)
+	defer handler.Close()
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if *parentStdin {

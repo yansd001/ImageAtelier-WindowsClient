@@ -150,7 +150,11 @@ type referenceData struct {
 }
 
 func (s *Store) generate(ctx context.Context, input GenerationRequest) ([]string, error) {
-	root, key, err := providerConfig(s.snapshot().Settings, input.Provider)
+	return s.generateWithProgress(ctx, s.snapshot().Settings, input, nil)
+}
+
+func (s *Store) generateWithProgress(ctx context.Context, settings Settings, input GenerationRequest, progress func([]string) error) ([]string, error) {
+	root, key, err := providerConfig(settings, input.Provider)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +190,11 @@ func (s *Store) generate(ctx context.Context, input GenerationRequest) ([]string
 			image, lastError = s.generateSingle(ctx, root, key, input, refs)
 			if lastError == nil {
 				images = append(images, image)
+				if progress != nil {
+					if err := progress(images); err != nil {
+						return images, err
+					}
+				}
 				break
 			}
 		}

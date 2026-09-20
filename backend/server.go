@@ -49,7 +49,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, value any, limit int64) 
 	return true
 }
 
-func newHandler(store *Store, webDir string, loopbackOnly bool) http.Handler {
+type applicationHandler struct {
+	http.Handler
+	jobs *taskRunner
+}
+
+func (h *applicationHandler) Close() { h.jobs.close() }
+
+func newHandler(store *Store, webDir string, loopbackOnly bool) *applicationHandler {
+	jobs := newTaskRunner(store)
 	mux := http.NewServeMux()
 	// Keep the existing web font while making the browser contact only this server.
 	mux.HandleFunc("GET /api/fonts/{name}", func(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +90,51 @@ func newHandler(store *Store, webDir string, loopbackOnly bool) http.Handler {
 	})
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) { sendJSON(w, 200, map[string]bool{"ok": true}) })
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) { sendJSON(w, 200, store.snapshot()) })
+	mux.HandleFunc("GET /api/gallery", func(w http.ResponseWriter, r *http.Request) {
+		sendJSON(w, 200, store.gallerySnapshot())
+	})
+	mux.HandleFunc("PATCH /api/gallery", func(w http.ResponseWriter, r *http.Request) {
+		var edit GalleryEdit
+		if !decodeJSON(w, r, &edit, 1<<20) {
+			return
+		}
+		if err := store.editGallery(edit); err != nil {
+			sendError(w, 400, err)
+			return
+		}
+		sendJSON(w, 200, store.gallerySnapshot())
+	})
+	mux.HandleFunc("POST /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		var task Task
+		if !decodeJSON(w, r, &task, 768<<20) {
+			return
+		}
+		if err := jobs.submit(r.Context(), task, false); err != nil {
+			sendError(w, 400, err)
+			return
+		}
+		sendJSON(w, http.StatusAccepted, store.gallerySnapshot())
+	})
+	mux.HandleFunc("POST /api/tasks/{id}/retry", func(w http.ResponseWriter, r *http.Request) {
+		if err := jobs.submit(r.Context(), Task{ID: r.PathValue("id")}, true); err != nil {
+			sendError(w, 400, err)
+			return
+		}
+		sendJSON(w, http.StatusAccepted, store.gallerySnapshot())
+	})
+	mux.HandleFunc("DELETE /api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			IDs []string `json:"ids"`
+		}
+		if !decodeJSON(w, r, &input, 1<<20) {
+			return
+		}
+		if err := jobs.remove(input.IDs); err != nil {
+			sendError(w, 500, err)
+			return
+		}
+		sendJSON(w, 200, store.gallerySnapshot())
+	})
 	mux.HandleFunc("PUT /api/settings", func(w http.ResponseWriter, r *http.Request) {
 		var settings Settings
 		if !decodeJSON(w, r, &settings, 1<<20) {
@@ -165,18 +218,6 @@ func newHandler(store *Store, webDir string, loopbackOnly bool) http.Handler {
 		}
 		sendJSON(w, 200, models)
 	})
-	mux.HandleFunc("POST /api/generate", func(w http.ResponseWriter, r *http.Request) {
-		var input GenerationRequest
-		if !decodeJSON(w, r, &input, 768<<20) {
-			return
-		}
-		images, err := store.generate(r.Context(), input)
-		if err != nil {
-			sendError(w, 502, err)
-			return
-		}
-		sendJSON(w, 200, map[string]any{"images": images})
-	})
 	mux.HandleFunc("POST /api/images/import", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
 			Source string `json:"source"`
@@ -216,7 +257,7 @@ func newHandler(store *Store, webDir string, loopbackOnly bool) http.Handler {
 		}
 		files.ServeHTTP(w, r)
 	})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return &applicationHandler{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		host := r.Host
@@ -242,5 +283,5 @@ func newHandler(store *Store, webDir string, loopbackOnly bool) http.Handler {
 			}
 		}
 		mux.ServeHTTP(w, r)
-	})
+	}), jobs}
 }

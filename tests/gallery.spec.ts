@@ -1,10 +1,30 @@
 import { test, expect, type Page } from '@playwright/test'
 import JSZip from 'jszip'
-import { createServer } from 'node:http'
+import { createServer, type RequestListener, type Server } from 'node:http'
 import { once } from 'node:events'
 import { defaultParams, defaultSettings } from '../src/types'
 
 const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5GkAAAAASUVORK5CYII='
+const mockProviders: Server[] = []
+
+async function mockImageProvider(page: Page, handler?: RequestListener) {
+  const server = createServer(handler ?? (async (request, response) => {
+    for await (const _ of request) { /* drain multipart references */ }
+    response.setHeader('Content-Type', 'application/json')
+    response.end(JSON.stringify({ data: [{ b64_json: png.split(',')[1] }] }))
+  })).listen(0, '127.0.0.1')
+  mockProviders.push(server)
+  await once(server, 'listening')
+  const { port } = server.address() as { port: number }
+  await page.request.put('/api/settings', { data: { ...defaultSettings, global: { baseUrl: `http://127.0.0.1:${port}`, apiKey: 'test-key' } } })
+}
+
+test.afterEach(async () => {
+  for (const server of mockProviders.splice(0)) {
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
 const fixtures = {
   workspaces: [{ id: 'space-1', name: '产品摄影', createdAt: 1 }, { id: 'space-2', name: '海报', createdAt: 2 }],
   tasks: [
@@ -83,7 +103,7 @@ test('create, remember, generate in, assign and clear a workspace', async ({ pag
   const workspaceId = await page.locator('#generation-workspace').inputValue()
   await page.reload()
   await expect(page.locator('#generation-workspace')).toHaveValue(workspaceId)
-  await page.route('**/api/generate', (route) => route.fulfill({ json: { images: [png] } }))
+  await mockImageProvider(page)
   await page.locator('.bottom-prompt-input').fill('新的工作区作品')
   await page.getByTitle('生成图片', { exact: true }).click()
   await expect(page.locator('.task-card').filter({ hasText: '新的工作区作品' })).toContainText('已生成 1 张图片')
@@ -262,4 +282,101 @@ test('failed initialization never saves empty defaults; settings failure keeps t
   await expect(page.locator('.toast')).toContainText('磁盘空间不足')
   await expect(page.locator('.settings-modal')).toBeVisible()
   expect((await (await page.request.get('/api/state')).json()).settings.global.apiKey).toBe('test-key')
+})
+
+test('refresh and closing every page leave reference generation running and backend saves the result', async ({ page, browser, request }) => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let calls = 0
+  await mockImageProvider(page, async (upstreamRequest, response) => {
+    const chunks: Buffer[] = []
+    for await (const chunk of upstreamRequest) chunks.push(chunk)
+    calls++
+    expect(upstreamRequest.url).toBe('/v1/images/edits')
+    expect(Buffer.concat(chunks).toString()).toContain('name="image[]"')
+    await gate
+    response.setHeader('Content-Type', 'application/json')
+    response.end(JSON.stringify({ data: [{ b64_json: png.split(',')[1] }] }))
+  })
+  const writes: string[] = []
+  page.on('request', (request) => {
+    if (request.method() === 'PUT' && request.url().endsWith('/api/gallery')) writes.push(request.url())
+  })
+  try {
+    await page.goto('/')
+    await page.locator('input[accept="image/*"]').setInputFiles({ name: 'reference.png', mimeType: 'image/png', buffer: Buffer.from(png.split(',')[1], 'base64') })
+    await page.locator('.bottom-prompt-input').fill('刷新与关闭后继续生成')
+    const accepted = page.waitForResponse((response) => response.url().endsWith('/api/tasks') && response.request().method() === 'POST')
+    await page.getByTitle('生成图片', { exact: true }).click()
+    expect((await accepted).status()).toBe(202)
+    await expect(page.locator('.task-card')).toContainText('生成中')
+    await expect.poll(() => calls).toBe(1)
+    await page.reload()
+    await expect(page.locator('.task-card')).toContainText('生成中')
+    await expect(page.locator('.task-card')).not.toContainText('已中断')
+    await page.locator('.task-card').getByTitle('收藏', { exact: true }).click()
+    await expect(page.locator('.task-card .is-favorite')).toHaveCount(1)
+    await page.locator('.task-card').getByTitle('设置工作区', { exact: true }).click()
+    await page.getByLabel('或新建工作区').fill('后台生成期间归类')
+    await page.getByRole('button', { name: '创建并使用', exact: true }).click()
+    await expect(page.locator('.task-card')).toContainText('后台生成期间归类')
+    expect(calls).toBe(1)
+    expect(writes).toEqual([])
+    await page.close()
+    release()
+    // No page is available to write the completion. Only Go can save it.
+    await expect.poll(async () => (await (await request.get('/api/state')).json()).gallery.tasks[0]?.status).toBe('done')
+    const state = await (await request.get('/api/state')).json()
+    expect(state.gallery.tasks[0].favorite).toBe(true)
+    expect(state.gallery.tasks[0].images[0]).toMatch(/^\/api\/images\//)
+    expect((await request.get(state.gallery.tasks[0].images[0])).ok()).toBe(true)
+    expect(calls).toBe(1)
+    const freshContext = await browser.newContext()
+    try {
+      const fresh = await freshContext.newPage()
+      await fresh.route('**/api/fonts/**', (route) => route.abort())
+      await fresh.goto('http://127.0.0.1:5173/')
+      await expect(fresh.locator('.task-card')).toContainText('已生成 1 张图片')
+      await expect(fresh.locator('.task-card')).toContainText('后台生成期间归类')
+      await expect(fresh.locator('.task-card img')).toBeVisible()
+      await expect(fresh.locator('.task-card .is-favorite')).toHaveCount(1)
+    } finally { await freshContext.close() }
+  } finally { release() }
+})
+
+test('retry continues across reload and polling recovers after a temporary connection failure', async ({ page }) => {
+  let calls = 0
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  await mockImageProvider(page, async (request, response) => {
+    for await (const _ of request) { /* consume request */ }
+    calls++
+    response.setHeader('Content-Type', 'application/json')
+    if (calls <= 2) { response.writeHead(502); response.end(JSON.stringify({ error: { message: '模拟生图失败' } })); return }
+    await gate
+    response.end(JSON.stringify({ data: [{ b64_json: png.split(',')[1] }] }))
+  })
+  try {
+    await page.goto('/')
+    await page.locator('.bottom-prompt-input').fill('重试任务刷新恢复')
+    await page.getByTitle('生成图片', { exact: true }).click()
+    await expect(page.locator('.task-card')).toContainText('模拟生图失败')
+    await page.getByRole('button', { name: '重试', exact: true }).click()
+    await expect(page.locator('.task-card')).toContainText('生成中')
+    await page.reload()
+    await expect(page.locator('.task-card')).toContainText('生成中')
+    await expect.poll(() => calls).toBe(3)
+    await page.route('**/api/gallery', async (route) => {
+      if (route.request().method() === 'GET') await route.fulfill({ status: 503, json: { error: '模拟连接中断' } })
+      else await route.continue()
+    })
+    await expect(page.getByRole('alert')).toContainText('模拟连接中断')
+    release()
+    await expect.poll(async () => (await (await page.request.get('/api/state')).json()).gallery.tasks[0]?.status).toBe('done')
+    await page.unroute('**/api/gallery')
+    await expect(page.locator('.task-card')).toContainText('已生成 1 张图片')
+    await expect(page.getByRole('alert')).toHaveCount(0)
+    await expect(page.locator('.task-card img')).toBeVisible()
+    expect(calls).toBe(3)
+  } finally { release() }
 })

@@ -3,6 +3,11 @@ import { apiRequest } from './backend'
 import { clearLegacyStorage, readLegacyState } from './legacyStorage'
 
 export type ModelSelections = Record<Provider, string>
+export interface GallerySnapshot {
+  tasks: Task[]
+  workspaces: Workspace[]
+  revision: number
+}
 export interface BackendState {
   settings: Settings
   modelSelections: ModelSelections
@@ -56,15 +61,38 @@ export async function loadGallery() {
   return state.gallery
 }
 
-export function saveGallery(tasks: Task[], workspaces: Workspace[]) {
+export async function readGallery(): Promise<GallerySnapshot> {
+  const snapshot = await apiRequest<GallerySnapshot>('/gallery')
+  galleryRevision = Math.max(galleryRevision ?? -1, snapshot.revision)
+  return snapshot
+}
+
+function galleryMutation(path: string, method: string, body: unknown) {
+  return enqueue(async () => {
+    const snapshot = await apiRequest<GallerySnapshot>(path, { method, body: JSON.stringify(body) })
+    galleryRevision = Math.max(galleryRevision ?? -1, snapshot.revision)
+    return snapshot
+  })
+}
+
+export const submitGeneration = (task: Task) => galleryMutation('/tasks', 'POST', task)
+export const retryGeneration = (id: string) => galleryMutation(`/tasks/${encodeURIComponent(id)}/retry`, 'POST', {})
+export const deleteTasks = (ids: string[]) => galleryMutation('/tasks', 'DELETE', { ids })
+export const editGallery = (edit: { taskIds?: string[]; favorite?: boolean; workspaceId?: string; workspace?: Workspace }) => galleryMutation('/gallery', 'PATCH', edit)
+
+export function replaceGallery(tasks: Task[], workspaces: Workspace[], revision?: number) {
   return enqueue(async () => {
     if (galleryRevision === undefined) await loadGallery()
-    const result = await apiRequest<{ tasks: Task[]; revision: number }>('/gallery', {
-      method: 'PUT', body: JSON.stringify({ tasks, workspaces, revision: galleryRevision }),
+    const result = await apiRequest<GallerySnapshot>('/gallery', {
+      method: 'PUT', body: JSON.stringify({ tasks, workspaces, revision: revision ?? galleryRevision }),
     })
-    galleryRevision = result.revision
-    return result.tasks
+    galleryRevision = Math.max(galleryRevision ?? -1, result.revision)
+    return result
   })
+}
+
+export async function saveGallery(tasks: Task[], workspaces: Workspace[]) {
+  return (await replaceGallery(tasks, workspaces)).tasks
 }
 
 export function saveLastWorkspace(id: string) {
