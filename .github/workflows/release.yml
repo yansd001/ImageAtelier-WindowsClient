@@ -1,0 +1,166 @@
+name: Publish Windows Release
+
+run-name: Publish ${{ inputs.version }} from ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号，例如 v1.0.0 或 v1.0.0-beta.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-windows-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test Windows package
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - name: Check out selected source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = $env:INPUT_VERSION.Trim()
+          if ($version -cnotmatch '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$') {
+            throw '版本号格式无效，请填写 v1.0.0、1.0.0 或 v1.0.0-beta.1。'
+          }
+          $tag = 'v' + ($version -creplace '^v', '')
+          $sourceCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "sha=$sourceCommit" >> $env:GITHUB_OUTPUT
+          "prerelease=$($tag.Contains('-').ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit and backend tests
+        run: npm test
+
+      - name: Check Go code
+        run: go vet ./backend
+
+      - name: Install browser for tests
+        run: npx playwright install chromium
+
+      - name: Run frontend integration tests
+        run: npm run test:ui
+
+      - name: Build and test the release package
+        run: npm run test:package
+
+      - name: Create Windows ZIP
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $bundle = Join-Path $env:RUNNER_TEMP 'release-archive/ImageAtelier'
+          New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+          Copy-Item -LiteralPath 'release/ImageAtelier/ImageAtelier.exe' -Destination $bundle
+          Copy-Item -LiteralPath 'release/ImageAtelier/frontend' -Destination $bundle -Recurse
+          $archiveName = "ImageAtelier-$env:RELEASE_TAG-windows-x64.zip"
+          $archive = Join-Path 'release' $archiveName
+          Compress-Archive -LiteralPath $bundle -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archiveName" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+      - name: Store release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            release/ImageAtelier-${{ steps.version.outputs.tag }}-windows-x64.zip
+            release/ImageAtelier-${{ steps.version.outputs.tag }}-windows-x64.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish to GitHub Releases
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      SOURCE_COMMIT: ${{ needs.build.outputs.sha }}
+      IS_PRERELEASE: ${{ needs.build.outputs.prerelease }}
+
+    steps:
+      - name: Download tested release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: assets
+
+      - name: Create version tag and draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum --check "ImageAtelier-${RELEASE_TAG}-windows-x64.zip.sha256"
+
+          # Creating a new ref fails if the version already exists; never retag it.
+          gh api --method POST "repos/${GH_REPO}/git/refs" \
+            -f "ref=refs/tags/${RELEASE_TAG}" -f "sha=${SOURCE_COMMIT}" > /dev/null
+
+          cat > release-notes.md <<'EOF'
+          Windows x64 版本。下载 ZIP 后完整解压，双击 ImageAtelier/ImageAtelier.exe 即可打开页面。
+
+          压缩包包含 Go 后端 exe 和 frontend 前端资源，不需要安装 Node.js 或 Go。
+          升级时请保留原程序目录中的 data 文件夹。
+          EOF
+
+          flags=()
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" \
+            "ImageAtelier-${RELEASE_TAG}-windows-x64.zip" \
+            "ImageAtelier-${RELEASE_TAG}-windows-x64.zip.sha256" \
+            --verify-tag --draft --title "Image Atelier ${RELEASE_TAG}" \
+            --notes-file release-notes.md --generate-notes "${flags[@]}"
+
+      - name: Publish completed release
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest=true
+          if [[ "$IS_PRERELEASE" == 'true' ]]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$latest"
+          printf 'Published [%s](%s/%s/releases/tag/%s)\n' \
+            "$RELEASE_TAG" "$GITHUB_SERVER_URL" "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"

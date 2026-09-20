@@ -34,6 +34,18 @@ ImageAtelier/
 
 如果提示端口被占用，请关闭仍在运行的旧后端，或指定其他端口。
 
+## GitHub 自动发布
+
+将 `.github/workflows/release.yml` 提交到默认分支后，在仓库的 **Actions → Publish Windows Release → Run workflow** 中操作：
+
+1. 在 **Use workflow from** 选择要打包的源码分支，该分支需要包含此工作流。
+2. 填写发布版本号，例如 `v1.0.0` 或 `1.0.0`，都会发布为 `v1.0.0`；`v1.0.0-beta.1` 等带后缀的版本会标记为预发布。
+3. 点击 **Run workflow**，等待测试、构建和发布完成，在仓库的 **Releases** 页面下载 `ImageAtelier-v1.0.0-windows-x64.zip`。
+
+工作流在 Windows 上运行现有单元测试、页面测试和实际 exe 发布包测试，通过后压缩 `ImageAtelier.exe` 与 `frontend/`，并将 ZIP 和 SHA256 校验文件上传到对应版本的 GitHub Release。解压后保留 `ImageAtelier/` 目录结构，可直接运行 exe；压缩包不包含本地 `data/`。
+
+版本标签指向本次选定分支的实际构建提交，已有版本标签不会被覆盖。工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需额外配置个人令牌；仓库或组织需允许工作流写入仓库内容以创建标签和 Release。发布过程中先创建草稿，附件上传成功后才公开；如发布阶段失败且已生成标签或草稿，修复问题后需先删除此次失败产生的标签和草稿，再使用同一版本号重新运行。
+
 ## 开发
 
 ```bash
